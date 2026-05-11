@@ -141,28 +141,57 @@ ${docText && docText.length > 50
 ---
 Produce the JSON RAMS now. Output JSON only.`;
 
-    const response = await client.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 8000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }]
-    });
+    // Helper: extract a JSON object from any string, even if AI added prose around it
+    const extractJson = (text) => {
+      // Strip markdown code fences if present
+      let s = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+      // Find the first { and the last } — anything in between should be the JSON
+      const firstBrace = s.indexOf('{');
+      const lastBrace = s.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        s = s.substring(firstBrace, lastBrace + 1);
+      }
+      return s;
+    };
 
-    let raw = response.content
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('\n')
-      .trim();
-
-    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    // Helper: try one AI call, return parsed RAMS or throw
+    const callOnce = async (extraInstruction = '') => {
+      const message = userMessage + (extraInstruction ? '\n\n' + extraInstruction : '');
+      const response = await client.messages.create({
+        model: 'claude-opus-4-5',
+        max_tokens: 8000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: message }]
+      });
+      const raw = response.content
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n')
+        .trim();
+      const cleaned = extractJson(raw);
+      return JSON.parse(cleaned);
+    };
 
     let rams;
     try {
-      rams = JSON.parse(raw);
+      // First attempt
+      rams = await callOnce();
     } catch (err) {
-      console.error('Failed to parse model output as JSON:', err);
-      return res.status(502).json({ error: 'AI returned invalid JSON' });
+      console.error('First attempt failed to parse:', err.message);
+      // Retry once with a stricter reminder. Uploaded PDFs can produce messy
+      // text that knocks the model off the JSON track — a single retry usually fixes it.
+      try {
+        rams = await callOnce(
+          'CRITICAL: Your previous response was not valid JSON. Return ONLY the JSON object — no preamble, no explanation, no markdown fences. Start your response with { and end with }.'
+        );
+      } catch (err2) {
+        console.error('Retry also failed:', err2.message);
+        return res.status(502).json({
+          error: 'The AI had trouble producing a structured RAMS for this input. This sometimes happens with very large or scanned documents. Try with a shorter scope or remove uploaded files and rely on the scope text.'
+        });
+      }
     }
+
 
     rams.project = rams.project || {};
     rams.project.docRef = 'N/A';
