@@ -84,8 +84,8 @@ For the scope provided, you must identify and assess every reasonably foreseeabl
     "contractor": string,
     "principalContractor": string,
     "docRef": string (always set to "N/A" — the contractor will fill in their own reference at issue),
-    "dateIssued": string (e.g. "10 May 2026"),
-    "reviewDate": string (90 days after issue, or sooner if scope changes)
+    "dateIssued": string (always set to today's date in UK format, e.g. "13 May 2026"),
+    "reviewDate": string (always set to empty string "" — the contractor will set this manually)
   },
   "scope": string (reworded clean version of contractor's scope, 1-3 paragraphs),
   "hazards": [
@@ -174,7 +174,7 @@ function buildRamsDocx(r) {
     ["Principal Contractor", r.project.principalContractor || "—"],
     ["Document ref", r.project.docRef],
     ["Date issued", r.project.dateIssued],
-    ["Review date", r.project.reviewDate],
+    ["Review date", r.project.reviewDate || "To be set on issue"],
   ];
   children.push(new Table({
     width: { size: 9360, type: WidthType.DXA },
@@ -543,10 +543,11 @@ Produce the JSON RAMS now. Output JSON only.`;
       }
     }
 
-    // Force docRef to N/A
+    // Force docRef to N/A, dateIssued to today, reviewDate to blank
     rams.project = rams.project || {};
     rams.project.docRef = 'N/A';
-    rams.project.dateIssued = rams.project.dateIssued || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    rams.project.dateIssued = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    rams.project.reviewDate = '';
 
     // Build the Word doc server-side
     let docxBuffer;
