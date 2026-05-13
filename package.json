@@ -1,6 +1,6 @@
 {
   "name": "schofield-rams",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Schofield Construction RAMS Generator",
   "main": "server.js",
   "scripts": {
@@ -10,7 +10,9 @@
     "express": "^4.21.0",
     "@anthropic-ai/sdk": "^0.32.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "docx": "^8.5.0",
+    "resend": "^4.0.1"
   },
   "engines": {
     "node": ">=18"
