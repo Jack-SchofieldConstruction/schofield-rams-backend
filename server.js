@@ -139,7 +139,7 @@ For the scope provided, you must identify and assess every reasonably foreseeabl
   ],
   "ppe": [string, ...],
   "method": [
-    { "step": string, "detail": string }
+    { "step": string (short title only, NO leading number or numbering — e.g. "Pre-commencement preparation" not "1. Pre-commencement preparation"), "detail": string }
   ],
   "plantEquipment": [string, ...],
   "coshh": [
@@ -283,10 +283,15 @@ function buildRamsDocx(r) {
   // Method statement
   children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "5. Method Statement", bold: true })] }));
   (r.method || []).forEach(s => {
+    // Strip any leading number the AI may have included (e.g. "1.", "1)", "Step 1:")
+    // since the Word numbered list adds its own "1.", "2." automatically.
+    const cleanStep = String(s.step || '')
+      .replace(/^\s*(?:step\s*)?\d+[\.\):\-]\s*/i, '')
+      .trim();
     children.push(new Paragraph({
       numbering: { reference: "numbers", level: 0 },
       children: [
-        new TextRun({ text: s.step + ": ", bold: true, size: 22 }),
+        new TextRun({ text: cleanStep + ": ", bold: true, size: 22 }),
         new TextRun({ text: s.detail, size: 22 })
       ]
     }));
