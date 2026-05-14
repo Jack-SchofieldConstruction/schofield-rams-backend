@@ -46,6 +46,43 @@ function rateLimit(req, res, next) {
   next();
 }
 
+// ===========================================================
+// IDEMPOTENCY CACHE
+// Prevents duplicate emails when a slow request gets retried
+// by the client before the server's response arrives. The
+// client sends X-Idempotency-Key with each retry; we cache
+// the response under that key and return it on subsequent calls.
+// ===========================================================
+const idempotencyCache = new Map();
+const IDEMPOTENCY_TTL = 5 * 60 * 1000; // 5 minutes
+
+function getIdempotent(key) {
+  if (!key) return null;
+  const entry = idempotencyCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.savedAt > IDEMPOTENCY_TTL) {
+    idempotencyCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function saveIdempotent(key, response) {
+  if (!key) return;
+  idempotencyCache.set(key, { savedAt: Date.now(), response });
+  // Clean up old entries occasionally to prevent unbounded growth
+  if (idempotencyCache.size > 1000) {
+    const cutoff = Date.now() - IDEMPOTENCY_TTL;
+    for (const [k, v] of idempotencyCache) {
+      if (v.savedAt < cutoff) idempotencyCache.delete(k);
+    }
+  }
+}
+
+// Track in-flight requests so a retry while the first is STILL processing
+// waits for it rather than starting a duplicate generation.
+const inFlight = new Map();
+
 const SYSTEM_PROMPT = `You are a UK Construction Health & Safety expert producing a Risk Assessment & Method Statement (RAMS) document compliant with the Construction (Design and Management) Regulations 2015 (CDM 2015) and HSE guidance HSG150.
 
 Your output MUST be valid JSON conforming exactly to the schema described below. Do not include any explanatory prose outside the JSON. Do not wrap the JSON in markdown code fences.
@@ -468,6 +505,7 @@ function isValidEmail(s) {
 app.post('/api/generate-rams', rateLimit, async (req, res) => {
   try {
     const { project, docText, contractorEmail } = req.body || {};
+    const idempotencyKey = req.headers['x-idempotency-key'] || null;
 
     if (!project || !project.projectName || !project.scope) {
       return res.status(400).json({ error: 'Project name and scope are required.' });
@@ -475,6 +513,36 @@ app.post('/api/generate-rams', rateLimit, async (req, res) => {
     if (!isValidEmail(contractorEmail)) {
       return res.status(400).json({ error: 'A valid contractor email is required.' });
     }
+
+    // Idempotency check — has this exact request already been processed?
+    // If yes, return the cached response without re-generating or re-sending.
+    if (idempotencyKey) {
+      const cached = getIdempotent(idempotencyKey);
+      if (cached) {
+        console.log('Idempotent hit for key:', idempotencyKey, '— returning cached response');
+        return res.json(cached.response);
+      }
+      // Or if a request with this key is already in flight, wait for it
+      const pending = inFlight.get(idempotencyKey);
+      if (pending) {
+        console.log('Idempotent in-flight for key:', idempotencyKey, '— awaiting');
+        try {
+          const result = await pending;
+          return res.json(result);
+        } catch (err) {
+          // Fall through; the original will report the error
+          return res.status(500).json({ error: 'Request failed; please try again.' });
+        }
+      }
+    }
+
+    // Create the work promise so concurrent retries can attach to it
+    let resolveWork, rejectWork;
+    const workPromise = new Promise((resolve, reject) => {
+      resolveWork = resolve;
+      rejectWork = reject;
+    });
+    if (idempotencyKey) inFlight.set(idempotencyKey, workPromise);
 
     const userMessage = `# Project information supplied by contractor
 
@@ -570,19 +638,33 @@ Produce the JSON RAMS now. Output JSON only.`;
     }
 
     // Return RAMS JSON + email status to frontend
-    res.json({
+    const responsePayload = {
       rams,
       emailStatus,
       contractorEmail
-    });
+    };
+
+    // Save to idempotency cache so retries return the same response
+    if (idempotencyKey) {
+      saveIdempotent(idempotencyKey, responsePayload);
+      inFlight.delete(idempotencyKey);
+      if (resolveWork) resolveWork(responsePayload);
+    }
+
+    res.json(responsePayload);
   } catch (err) {
     console.error('RAMS generation error:', err);
+    // Clean up in-flight tracking on error so retries can attempt fresh
+    const key = req.headers['x-idempotency-key'];
+    if (key) {
+      inFlight.delete(key);
+    }
     res.status(500).json({ error: err.message });
   }
 });
 
 // Health check
-app.get('/api/health', (req, res) => res.json({ ok: true, version: '1.1' }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: '1.2' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
