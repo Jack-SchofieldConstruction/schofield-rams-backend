@@ -755,6 +755,12 @@ app.post('/api/create-checkout', async (req, res) => {
     const entry = pendingRams.get(ramsId);
     if (!entry) return res.status(404).json({ error: 'This RAMS has expired — please generate it again.' });
     const projectName = (entry.rams.project && entry.rams.project.name) || 'RAMS document';
+    // Return to whichever page started checkout (validated to our own site).
+    let base = SITE_URL;
+    const returnUrl = req.body && req.body.returnUrl;
+    if (typeof returnUrl === 'string' && returnUrl.indexOf('https://schofieldconstruction.site') === 0) {
+      base = returnUrl.split('?')[0].replace(/\/+$/, '');
+    }
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{
@@ -770,8 +776,8 @@ app.post('/api/create-checkout', async (req, res) => {
       }],
       customer_email: entry.contractorEmail,
       metadata: { ramsId },
-      success_url: SITE_URL + '/?paid=1&ramsId=' + ramsId + '&session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: SITE_URL + '/?canceled=1&ramsId=' + ramsId
+      success_url: base + '/?paid=1&ramsId=' + ramsId + '&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: base + '/?canceled=1&ramsId=' + ramsId
     });
     res.json({ url: session.url });
   } catch (err) {
