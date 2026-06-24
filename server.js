@@ -1,91 +1,46 @@
 /**
  * Schofield Construction — RAMS Generator
- * v1.3 — more robust Anthropic handling, safer JSON parsing, better Render stability
+ * v1.1 — adds email delivery via Resend
  *
  * Required environment variables:
  *   ANTHROPIC_API_KEY — Claude API key for AI generation
  *   RESEND_API_KEY    — Resend API key for sending emails
- *
- * Optional environment variables:
- *   ANTHROPIC_MODEL   — defaults to claude-opus-4-5
  */
 
 require('dotenv').config();
-
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Resend } = require('resend');
-
 const {
-  Document,
-  Packer,
-  Paragraph,
-  TextRun,
-  HeadingLevel,
-  AlignmentType,
-  Table,
-  TableRow,
-  TableCell,
-  BorderStyle,
-  WidthType,
-  ShadingType,
-  LevelFormat,
-  PageNumber,
-  Header,
-  Footer
+  Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
+  Table, TableRow, TableCell, BorderStyle, WidthType, ShadingType,
+  LevelFormat, PageNumber, Header, Footer
 } = require('docx');
 
 const app = express();
-
 app.use(cors());
-app.use(express.json({ limit: '12mb' }));
+app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.warn('WARNING: ANTHROPIC_API_KEY is missing.');
-}
-
-if (!process.env.RESEND_API_KEY) {
-  console.warn('WARNING: RESEND_API_KEY is missing.');
-}
-
-const claude = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
-
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const resend = new Resend(process.env.RESEND_API_KEY);
-
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-opus-4-5';
 
 // Internal CC address — always copied on RAMS emails
 const INTERNAL_CC = 'info@schofieldconstruction.site';
 const FROM_ADDRESS = 'Schofield Construction <info@schofieldconstruction.site>';
 
-// Keep this lower than the frontend 80,000 char limit.
-// This protects Render + Anthropic from very large uploaded docs.
-const MAX_DOC_TEXT_CHARS = 25000;
-const MAX_SCOPE_CHARS = 6000;
-const MAX_HAZARDS_CHARS = 4000;
-
-// ===========================================================
-// SIMPLE RATE LIMIT
-// ===========================================================
+// Simple rate limit
 const callLog = new Map();
-
 function rateLimit(req, res, next) {
-  const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+  const ip = req.ip;
   const now = Date.now();
   const bucket = callLog.get(ip) || [];
   const recent = bucket.filter(t => now - t < 60_000);
-
   if (recent.length >= 10) {
-    return res.status(429).json({
-      error: 'Too many requests, please wait a minute.'
-    });
+    return res.status(429).json({ error: 'Too many requests, please wait a minute.' });
   }
-
   recent.push(now);
   callLog.set(ip, recent);
   next();
@@ -93,60 +48,41 @@ function rateLimit(req, res, next) {
 
 // ===========================================================
 // IDEMPOTENCY CACHE
-// Prevents duplicate emails when the frontend retries.
+// Prevents duplicate emails when a slow request gets retried
+// by the client before the server's response arrives. The
+// client sends X-Idempotency-Key with each retry; we cache
+// the response under that key and return it on subsequent calls.
 // ===========================================================
 const idempotencyCache = new Map();
-const inFlight = new Map();
 const IDEMPOTENCY_TTL = 5 * 60 * 1000; // 5 minutes
 
 function getIdempotent(key) {
   if (!key) return null;
-
   const entry = idempotencyCache.get(key);
   if (!entry) return null;
-
   if (Date.now() - entry.savedAt > IDEMPOTENCY_TTL) {
     idempotencyCache.delete(key);
     return null;
   }
-
-  return entry.response;
+  return entry;
 }
 
 function saveIdempotent(key, response) {
   if (!key) return;
-
-  idempotencyCache.set(key, {
-    savedAt: Date.now(),
-    response
-  });
-
+  idempotencyCache.set(key, { savedAt: Date.now(), response });
+  // Clean up old entries occasionally to prevent unbounded growth
   if (idempotencyCache.size > 1000) {
     const cutoff = Date.now() - IDEMPOTENCY_TTL;
-
     for (const [k, v] of idempotencyCache) {
-      if (v.savedAt < cutoff) {
-        idempotencyCache.delete(k);
-      }
+      if (v.savedAt < cutoff) idempotencyCache.delete(k);
     }
   }
 }
 
-function truncateText(value, maxChars) {
-  const text = String(value || '');
-  if (text.length <= maxChars) return text;
+// Track in-flight requests so a retry while the first is STILL processing
+// waits for it rather than starting a duplicate generation.
+const inFlight = new Map();
 
-  return text.slice(0, maxChars) +
-    `\n\n[TRUNCATED: original extracted text was ${text.length} characters. Only the first ${maxChars} characters were sent for stability.]`;
-}
-
-function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ===========================================================
-// SYSTEM PROMPT
-// ===========================================================
 const SYSTEM_PROMPT = `You are a UK Construction Health & Safety expert producing a Risk Assessment & Method Statement (RAMS) document compliant with the Construction (Design and Management) Regulations 2015 (CDM 2015) and HSE guidance HSG150.
 
 Your output MUST be valid JSON conforming exactly to the schema described below. Do not include any explanatory prose outside the JSON. Do not wrap the JSON in markdown code fences.
@@ -164,21 +100,19 @@ Use the standard HSE 5x5 matrix:
 For the scope provided, you must identify and assess every reasonably foreseeable hazard. Standard construction hazards to consider:
 - Manual handling, working at height, falling objects
 - Slips, trips, falls on the level
-- Electrical hazards, live services, isolation, LOTO
-- Plant & equipment, PUWER, lifting operations, LOLER
-- Hazardous substances, COSHH, dust, silica, solvents, sealants
-- Asbestos, CAR 2012, assume pre-2000 buildings need R&D survey
-- Confined spaces and excavations where relevant
+- Electrical hazards (live services, isolation, LOTO)
+- Plant & equipment (PUWER), lifting operations (LOLER)
+- Hazardous substances (COSHH) — dust, silica, solvents, sealants
+- Asbestos (CAR 2012) — assume pre-2000 buildings need R&D survey
+- Confined spaces, excavations
 - Fire and emergency
 - Noise and HAVS
-- Welfare
+- Welfare, COVID/biological where relevant
 - Public, occupants and adjacent contractors interface
 - Traffic management on site
 - Temporary works
 
-# JSON schema
-Return EXACTLY this structure:
-
+# JSON schema (return EXACTLY this structure)
 {
   "title": "Risk Assessment & Method Statement — <Project>",
   "project": {
@@ -186,486 +120,116 @@ Return EXACTLY this structure:
     "address": string,
     "contractor": string,
     "principalContractor": string,
-    "docRef": "N/A",
-    "dateIssued": string,
-    "reviewDate": ""
+    "docRef": string (always set to "N/A" — the contractor will fill in their own reference at issue),
+    "dateIssued": string (always set to today's date in UK format, e.g. "13 May 2026"),
+    "reviewDate": string (always set to empty string "" — the contractor will set this manually)
   },
-  "scope": string,
+  "scope": string (reworded clean version of contractor's scope, 1-3 paragraphs),
   "hazards": [
     {
-      "activity": string,
-      "hazard": string,
-      "personsAtRisk": [string],
-      "likelihood": integer,
-      "severity": integer,
-      "initialRisk": integer,
-      "controls": [string],
+      "activity": string (specific work activity),
+      "hazard": string (what causes harm),
+      "personsAtRisk": [string, ...],
+      "likelihood": integer 1-5,
+      "severity": integer 1-5,
+      "initialRisk": integer (likelihood * severity),
+      "controls": [string, ...],
       "residualRisk": integer
     }
   ],
-  "ppe": [string],
+  "ppe": [string, ...],
   "method": [
-    {
-      "step": string,
-      "detail": string
-    }
+    { "step": string (short title only, NO leading number or numbering — e.g. "Pre-commencement preparation" not "1. Pre-commencement preparation"), "detail": string }
   ],
-  "plantEquipment": [string],
+  "plantEquipment": [string, ...],
   "coshh": [
-    {
-      "substance": string,
-      "hazard": string,
-      "controls": string
-    }
+    { "substance": string, "hazard": string, "controls": string }
   ],
-  "emergency": [string],
-  "training": [string],
-  "assumptions": [string]
+  "emergency": [string, ...],
+  "training": [string, ...],
+  "assumptions": [string, ...]
 }
 
 # Critical rules
 1. Be specific to the trade and scope. No generic boilerplate.
-2. Identify at least 5 distinct hazards for any non-trivial scope.
-3. Where the supplied documentation is silent on a critical point, add a clear item to "assumptions".
+2. Identify at least 5 distinct hazards for any non-trivial scope, more if warranted.
+3. Where the supplied documentation is silent on a critical point, add a clear item to "assumptions" rather than inventing facts.
 4. Use UK terminology.
 5. Cite EN/BS standards for PPE where applicable.
 6. The method statement steps must be in logical sequence.
-7. ALL output keys are required. If a section genuinely does not apply, return [] not omitted.
-8. Output JSON only. Nothing else.
-9. Keep the JSON compact enough to complete reliably. Do not write unnecessary long prose.`;
-
-// ===========================================================
-// JSON HELPERS
-// ===========================================================
-function extractJson(text) {
-  let s = String(text || '').trim();
-
-  s = s
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/```\s*$/i, '')
-    .trim();
-
-  const firstBrace = s.indexOf('{');
-  const lastBrace = s.lastIndexOf('}');
-
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    s = s.substring(firstBrace, lastBrace + 1);
-  }
-
-  return s;
-}
-
-function safeArray(value) {
-  if (Array.isArray(value)) return value;
-  if (value === undefined || value === null || value === '') return [];
-  return [String(value)];
-}
-
-function safeString(value, fallback = '') {
-  if (value === undefined || value === null) return fallback;
-  return String(value);
-}
-
-function clampInt(value, min, max, fallback) {
-  const n = Number.parseInt(value, 10);
-  if (Number.isNaN(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-function normaliseRams(rams, projectInput) {
-  const today = new Date().toLocaleDateString('en-GB', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric'
-  });
-
-  const output = rams && typeof rams === 'object' ? rams : {};
-
-  output.project = output.project && typeof output.project === 'object'
-    ? output.project
-    : {};
-
-  output.title = safeString(
-    output.title,
-    `Risk Assessment & Method Statement — ${projectInput.projectName || 'Project'}`
-  );
-
-  output.project.name = safeString(output.project.name, projectInput.projectName || 'Project');
-  output.project.address = safeString(output.project.address, projectInput.siteAddress || 'Not supplied');
-  output.project.contractor = safeString(output.project.contractor, projectInput.contractor || 'Not supplied');
-  output.project.principalContractor = safeString(
-    output.project.principalContractor,
-    projectInput.principalContractor || projectInput.contractor || 'Not supplied'
-  );
-
-  output.project.docRef = 'N/A';
-  output.project.dateIssued = today;
-  output.project.reviewDate = '';
-
-  output.scope = safeString(output.scope, projectInput.scope || '');
-
-  output.hazards = safeArray(output.hazards).map((h, index) => {
-    const item = h && typeof h === 'object' ? h : {};
-
-    const likelihood = clampInt(item.likelihood, 1, 5, 3);
-    const severity = clampInt(item.severity, 1, 5, 3);
-    const initialRisk = clampInt(item.initialRisk, 1, 25, likelihood * severity);
-
-    let residualRisk = clampInt(item.residualRisk, 1, 25, Math.max(1, Math.min(7, initialRisk - 2)));
-    if (residualRisk >= initialRisk) {
-      residualRisk = Math.max(1, initialRisk - 1);
-    }
-
-    return {
-      activity: safeString(item.activity, `Activity ${index + 1}`),
-      hazard: safeString(item.hazard, 'Hazard to be reviewed'),
-      personsAtRisk: safeArray(item.personsAtRisk).map(String),
-      likelihood,
-      severity,
-      initialRisk,
-      controls: safeArray(item.controls).map(String),
-      residualRisk
-    };
-  });
-
-  output.ppe = safeArray(output.ppe).map(String);
-
-  output.method = safeArray(output.method).map((m, index) => {
-    const item = m && typeof m === 'object' ? m : {};
-    return {
-      step: safeString(item.step, `Step ${index + 1}`)
-        .replace(/^\s*(?:step\s*)?\d+[\.\):\-]\s*/i, '')
-        .trim(),
-      detail: safeString(item.detail, String(m || ''))
-    };
-  });
-
-  output.plantEquipment = safeArray(output.plantEquipment).map(String);
-
-  output.coshh = safeArray(output.coshh).map(c => {
-    const item = c && typeof c === 'object' ? c : {};
-    return {
-      substance: safeString(item.substance, 'To be confirmed'),
-      hazard: safeString(item.hazard, 'To be reviewed'),
-      controls: safeString(item.controls, 'Use in accordance with manufacturer instructions and COSHH assessment.')
-    };
-  });
-
-  output.emergency = safeArray(output.emergency).map(String);
-  output.training = safeArray(output.training).map(String);
-  output.assumptions = safeArray(output.assumptions).map(String);
-
-  if (!output.hazards.length) {
-    output.hazards.push({
-      activity: 'General construction activity',
-      hazard: 'Hazards not fully identified due to limited information supplied',
-      personsAtRisk: ['Operatives', 'Other contractors', 'Members of the public where applicable'],
-      likelihood: 3,
-      severity: 3,
-      initialRisk: 9,
-      controls: [
-        'Competent person to review the scope before works commence.',
-        'Site-specific briefing to be completed before starting.',
-        'Stop works if undocumented hazards are identified.'
-      ],
-      residualRisk: 4
-    });
-
-    output.assumptions.push('Limited information was supplied. The RAMS must be reviewed by a competent person before issue.');
-  }
-
-  if (!output.method.length) {
-    output.method.push({
-      step: 'Pre-start review',
-      detail: 'Review the site conditions, scope, access, emergency arrangements and known hazards before works commence.'
-    });
-  }
-
-  return output;
-}
-
-function parseRamsJson(rawText, projectInput) {
-  const cleaned = extractJson(rawText);
-
-  try {
-    const parsed = JSON.parse(cleaned);
-    return normaliseRams(parsed, projectInput);
-  } catch (err) {
-    console.error('JSON parse failed:', err.message);
-    console.error('Raw AI output preview:', String(rawText || '').slice(0, 1200));
-    throw new Error('AI returned invalid JSON.');
-  }
-}
-
-// ===========================================================
-// ANTHROPIC CALL
-// ===========================================================
-async function callClaudeForRams(project, docText) {
-  const safeProject = {
-    projectName: truncateText(project.projectName, 300),
-    siteAddress: truncateText(project.siteAddress, 500),
-    contractor: truncateText(project.contractor, 300),
-    principalContractor: truncateText(project.principalContractor, 300),
-    scope: truncateText(project.scope, MAX_SCOPE_CHARS),
-    knownHazards: truncateText(project.knownHazards, MAX_HAZARDS_CHARS)
-  };
-
-  const safeDocText = truncateText(docText || '', MAX_DOC_TEXT_CHARS);
-
-  const userMessage = `# Project information supplied by contractor
-
-Project name: ${safeProject.projectName}
-Site address: ${safeProject.siteAddress || '[not supplied]'}
-Contractor: ${safeProject.contractor || '[not supplied]'}
-Principal Contractor: ${safeProject.principalContractor || '[same as contractor]'}
-
-# Scope of works
-${safeProject.scope}
-
-# Known hazards / constraints flagged by contractor
-${safeProject.knownHazards || '[none flagged — you must still identify hazards from the scope]'}
-
-# Supporting site documentation, extracted text
-${safeDocText && safeDocText.length > 50
-    ? safeDocText
-    : '[No supporting documents uploaded. Generate the RAMS from the scope and call out gaps in the assumptions array.]'}
-
----
-Produce the JSON RAMS now. Output JSON only.`;
-
-  const attempts = [
-    {
-      name: 'primary',
-      maxTokens: 5000,
-      extraInstruction: ''
-    },
-    {
-      name: 'json-retry',
-      maxTokens: 4500,
-      extraInstruction: 'CRITICAL: Return ONLY a valid JSON object. No markdown. No commentary. Start with { and end with }. Keep wording concise.'
-    },
-    {
-      name: 'compact-retry',
-      maxTokens: 3500,
-      extraInstruction: 'CRITICAL: Return compact valid JSON only. Reduce wording length. Include at least 5 hazards but keep each control concise.'
-    }
-  ];
-
-  let lastError = null;
-
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-
-    try {
-      console.log(`Calling Anthropic attempt ${i + 1}/${attempts.length}: ${attempt.name}`);
-
-      const response = await claude.messages.create({
-        model: ANTHROPIC_MODEL,
-        max_tokens: attempt.maxTokens,
-        temperature: 0.2,
-        system: SYSTEM_PROMPT,
-        messages: [
-          {
-            role: 'user',
-            content: userMessage + (attempt.extraInstruction ? `\n\n${attempt.extraInstruction}` : '')
-          }
-        ]
-      });
-
-      const raw = response.content
-        .filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('\n')
-        .trim();
-
-      if (!raw) {
-        throw new Error('Anthropic returned an empty response.');
-      }
-
-      const rams = parseRamsJson(raw, project);
-      console.log(`Anthropic attempt ${attempt.name} succeeded.`);
-      return rams;
-
-    } catch (err) {
-      lastError = err;
-
-      const message = err && err.message ? err.message : String(err);
-      console.error(`Anthropic attempt ${attempt.name} failed:`, message);
-
-      if (i < attempts.length - 1) {
-        await wait(1500 * (i + 1));
-      }
-    }
-  }
-
-  const finalMessage = lastError && lastError.message
-    ? lastError.message
-    : 'Unknown Anthropic failure';
-
-  throw new Error(`AI generation failed after retries: ${finalMessage}`);
-}
+7. ALL output keys are required. If a section genuinely doesn't apply, return [] not omitted.
+8. Output JSON only. Nothing else.`;
 
 // ============================================================
-// WORD DOCUMENT BUILDER
+// WORD DOCUMENT BUILDER (server-side, mirrors the frontend)
 // ============================================================
 function buildRamsDocx(r) {
-  const border = {
-    style: BorderStyle.SINGLE,
-    size: 6,
-    color: '1A1F1B'
-  };
-
-  const cellBorders = {
-    top: border,
-    bottom: border,
-    left: border,
-    right: border
-  };
+  const border = { style: BorderStyle.SINGLE, size: 6, color: "1A1F1B" };
+  const cellBorders = { top: border, bottom: border, left: border, right: border };
 
   const headerCell = (text, width) => new TableCell({
     borders: cellBorders,
     width: { size: width, type: WidthType.DXA },
-    shading: { fill: '1A1F1B', type: ShadingType.CLEAR, color: 'auto' },
+    shading: { fill: "1A1F1B", type: ShadingType.CLEAR, color: "auto" },
     margins: { top: 80, bottom: 80, left: 120, right: 120 },
-    children: [
-      new Paragraph({
-        children: [
-          new TextRun({
-            text,
-            bold: true,
-            color: 'FFD400',
-            size: 18
-          })
-        ]
-      })
-    ]
+    children: [new Paragraph({ children: [new TextRun({ text, bold: true, color: "FFD400", size: 18 })] })]
   });
 
   const cell = (text, width, opts = {}) => new TableCell({
     borders: cellBorders,
     width: { size: width, type: WidthType.DXA },
-    shading: opts.fill
-      ? { fill: opts.fill, type: ShadingType.CLEAR, color: 'auto' }
-      : undefined,
+    shading: opts.fill ? { fill: opts.fill, type: ShadingType.CLEAR, color: "auto" } : undefined,
     margins: { top: 80, bottom: 80, left: 120, right: 120 },
     children: (Array.isArray(text) ? text : [text]).map(t =>
-      new Paragraph({
-        children: [
-          new TextRun({
-            text: String(t || ''),
-            size: 20,
-            bold: opts.bold || false
-          })
-        ]
-      })
+      new Paragraph({ children: [new TextRun({ text: String(t), size: 20, bold: opts.bold || false })] })
     )
   });
 
-  const riskFill = score => {
-    const n = Number(score) || 0;
-    return n >= 15 ? 'FDE0DB' : n >= 8 ? 'FFF3CC' : 'DFF0D6';
-  };
+  const riskFill = score => score >= 15 ? "FDE0DB" : score >= 8 ? "FFF3CC" : "DFF0D6";
 
   const children = [];
 
+  // Title
   children.push(new Paragraph({
     heading: HeadingLevel.TITLE,
     alignment: AlignmentType.CENTER,
     spacing: { after: 200 },
-    children: [
-      new TextRun({
-        text: r.title || 'RISK ASSESSMENT & METHOD STATEMENT',
-        bold: true,
-        size: 40
-      })
-    ]
+    children: [new TextRun({ text: r.title || "RISK ASSESSMENT & METHOD STATEMENT", bold: true, size: 40 })]
   }));
-
   children.push(new Paragraph({
     alignment: AlignmentType.CENTER,
     spacing: { after: 400 },
-    children: [
-      new TextRun({
-        text: 'CDM 2015 Compliant',
-        italics: true,
-        size: 22,
-        color: '5A5F56'
-      })
-    ]
+    children: [new TextRun({ text: "CDM 2015 Compliant", italics: true, size: 22, color: "5A5F56" })]
   }));
 
-  children.push(new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    children: [
-      new TextRun({
-        text: '1. Project Information',
-        bold: true
-      })
-    ]
-  }));
-
+  // Section 1: project info
+  children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: "1. Project Information", bold: true })] }));
   const projRows = [
-    ['Project', r.project.name],
-    ['Site address', r.project.address],
-    ['Contractor', r.project.contractor],
-    ['Principal Contractor', r.project.principalContractor || '—'],
-    ['Document ref', r.project.docRef || 'N/A'],
-    ['Date issued', r.project.dateIssued],
-    ['Review date', r.project.reviewDate || 'To be set on issue']
+    ["Project", r.project.name],
+    ["Site address", r.project.address],
+    ["Contractor", r.project.contractor],
+    ["Principal Contractor", r.project.principalContractor || "—"],
+    ["Document ref", r.project.docRef],
+    ["Date issued", r.project.dateIssued],
+    ["Review date", r.project.reviewDate || "To be set on issue"],
   ];
-
   children.push(new Table({
     width: { size: 9360, type: WidthType.DXA },
     columnWidths: [2800, 6560],
     rows: projRows.map(([k, v]) => new TableRow({
-      children: [
-        cell(k, 2800, { fill: 'EBE6DA', bold: true }),
-        cell(v || '—', 6560)
-      ]
+      children: [cell(k, 2800, { fill: "EBE6DA", bold: true }), cell(v || "—", 6560)]
     }))
   }));
 
-  children.push(new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 300 },
-    children: [
-      new TextRun({
-        text: '2. Scope of Works',
-        bold: true
-      })
-    ]
-  }));
+  // Section 2: scope
+  children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "2. Scope of Works", bold: true })] }));
+  children.push(new Paragraph({ children: [new TextRun({ text: r.scope, size: 22 })] }));
 
-  children.push(new Paragraph({
-    children: [
-      new TextRun({
-        text: r.scope || '',
-        size: 22
-      })
-    ]
-  }));
-
-  children.push(new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 300 },
-    children: [
-      new TextRun({
-        text: '3. Hazard Identification & Risk Assessment (5×5)',
-        bold: true
-      })
-    ]
-  }));
-
+  // Section 3: hazards
+  children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "3. Hazard Identification & Risk Assessment (5×5)", bold: true })] }));
   children.push(new Paragraph({
     spacing: { after: 150 },
-    children: [
-      new TextRun({
-        text: 'L = Likelihood (1–5), S = Severity (1–5), Risk = L × S. Green ≤7, Amber 8–14, Red ≥15.',
-        size: 18,
-        italics: true,
-        color: '5A5F56'
-      })
-    ]
+    children: [new TextRun({ text: "L = Likelihood (1–5), S = Severity (1–5), Risk = L × S. Green ≤7, Amber 8–14, Red ≥15.", size: 18, italics: true, color: "5A5F56" })]
   }));
 
   children.push(new Table({
@@ -675,385 +239,186 @@ function buildRamsDocx(r) {
       new TableRow({
         tableHeader: true,
         children: [
-          headerCell('#', 400),
-          headerCell('Activity / hazard', 1700),
-          headerCell('Persons at risk', 1300),
-          headerCell('L', 400),
-          headerCell('S', 400),
-          headerCell('Initial', 600),
-          headerCell('Controls (hierarchy)', 3360),
-          headerCell('Residual', 1200)
+          headerCell("#", 400),
+          headerCell("Activity / hazard", 1700),
+          headerCell("Persons at risk", 1300),
+          headerCell("L", 400),
+          headerCell("S", 400),
+          headerCell("Initial", 600),
+          headerCell("Controls (hierarchy)", 3360),
+          headerCell("Residual", 1200),
         ]
       }),
-      ...(r.hazards || []).map((h, i) => new TableRow({
+      ...r.hazards.map((h, i) => new TableRow({
         children: [
           cell(String(i + 1), 400),
           cell([h.activity, h.hazard], 1700),
-          cell((h.personsAtRisk || []).join(', '), 1300),
+          cell((h.personsAtRisk || []).join(", "), 1300),
           cell(String(h.likelihood), 400),
           cell(String(h.severity), 400),
-          cell(String(h.initialRisk), 600, {
-            fill: riskFill(h.initialRisk),
-            bold: true
-          }),
-          cell((h.controls || []).map(c => `• ${c}`), 3360),
-          cell(String(h.residualRisk), 1200, {
-            fill: riskFill(h.residualRisk),
-            bold: true
-          })
+          cell(String(h.initialRisk), 600, { fill: riskFill(h.initialRisk), bold: true }),
+          cell((h.controls || []).map(c => "• " + c), 3360),
+          cell(String(h.residualRisk), 1200, { fill: riskFill(h.residualRisk), bold: true }),
         ]
       }))
     ]
   }));
 
+  // Bullet sections helper
   const bulletSection = (title, items, num) => {
-    children.push(new Paragraph({
-      heading: HeadingLevel.HEADING_1,
-      spacing: { before: 300 },
-      children: [
-        new TextRun({
-          text: `${num}. ${title}`,
-          bold: true
-        })
-      ]
-    }));
-
-    if (items && items.length) {
-      items.forEach(t => {
-        children.push(new Paragraph({
-          numbering: {
-            reference: 'bullets',
-            level: 0
-          },
-          children: [
-            new TextRun({
-              text: String(t),
-              size: 22
-            })
-          ]
-        }));
-      });
-    } else {
+    children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: `${num}. ${title}`, bold: true })] }));
+    (items || []).forEach(t => {
       children.push(new Paragraph({
-        children: [
-          new TextRun({
-            text: 'Not applicable.',
-            italics: true,
-            size: 22
-          })
-        ]
+        numbering: { reference: "bullets", level: 0 },
+        children: [new TextRun({ text: String(t), size: 22 })]
       }));
+    });
+    if (!items || !items.length) {
+      children.push(new Paragraph({ children: [new TextRun({ text: "Not applicable.", italics: true, size: 22 })] }));
     }
   };
 
-  bulletSection('PPE Requirements', r.ppe, 4);
+  bulletSection("PPE Requirements", r.ppe, 4);
 
-  children.push(new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 300 },
-    children: [
-      new TextRun({
-        text: '5. Method Statement',
-        bold: true
-      })
-    ]
-  }));
-
+  // Method statement
+  children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "5. Method Statement", bold: true })] }));
   (r.method || []).forEach(s => {
+    // Strip any leading number the AI may have included (e.g. "1.", "1)", "Step 1:")
+    // since the Word numbered list adds its own "1.", "2." automatically.
     const cleanStep = String(s.step || '')
       .replace(/^\s*(?:step\s*)?\d+[\.\):\-]\s*/i, '')
       .trim();
-
     children.push(new Paragraph({
-      numbering: {
-        reference: 'numbers',
-        level: 0
-      },
+      numbering: { reference: "numbers", level: 0 },
       children: [
-        new TextRun({
-          text: `${cleanStep || 'Step'}: `,
-          bold: true,
-          size: 22
-        }),
-        new TextRun({
-          text: String(s.detail || ''),
-          size: 22
-        })
+        new TextRun({ text: cleanStep + ": ", bold: true, size: 22 }),
+        new TextRun({ text: s.detail, size: 22 })
       ]
     }));
   });
 
-  bulletSection('Plant, Equipment & Materials', r.plantEquipment, 6);
+  bulletSection("Plant, Equipment & Materials", r.plantEquipment, 6);
 
-  children.push(new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 300 },
-    children: [
-      new TextRun({
-        text: '7. COSHH / Hazardous Substances',
-        bold: true
-      })
-    ]
-  }));
-
-  if (r.coshh && r.coshh.length) {
+  // COSHH
+  children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "7. COSHH / Hazardous Substances", bold: true })] }));
+  if ((r.coshh || []).length) {
     children.push(new Table({
       width: { size: 9360, type: WidthType.DXA },
       columnWidths: [2400, 2800, 4160],
       rows: [
         new TableRow({
           tableHeader: true,
-          children: [
-            headerCell('Substance', 2400),
-            headerCell('Hazard', 2800),
-            headerCell('Controls', 4160)
-          ]
+          children: [headerCell("Substance", 2400), headerCell("Hazard", 2800), headerCell("Controls", 4160)]
         }),
         ...r.coshh.map(c => new TableRow({
-          children: [
-            cell(c.substance, 2400),
-            cell(c.hazard, 2800),
-            cell(c.controls, 4160)
-          ]
+          children: [cell(c.substance, 2400), cell(c.hazard, 2800), cell(c.controls, 4160)]
         }))
       ]
     }));
   } else {
-    children.push(new Paragraph({
-      children: [
-        new TextRun({
-          text: 'No hazardous substances identified for this scope.',
-          italics: true,
-          size: 22
-        })
-      ]
-    }));
+    children.push(new Paragraph({ children: [new TextRun({ text: "No hazardous substances identified for this scope.", italics: true, size: 22 })] }));
   }
 
-  bulletSection('Emergency Procedures', r.emergency, 8);
-  bulletSection('Training & Competence', r.training, 9);
+  bulletSection("Emergency Procedures", r.emergency, 8);
+  bulletSection("Training & Competence", r.training, 9);
 
-  children.push(new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 300 },
-    children: [
-      new TextRun({
-        text: '10. Sign-off & Briefing',
-        bold: true
-      })
-    ]
-  }));
-
+  // Sign-off
+  children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "10. Sign-off & Briefing", bold: true })] }));
   const signRows = [
-    ['Prepared by', ''],
-    ['Position', ''],
-    ['Signature / Date', ''],
-    ['Reviewed by (PC)', ''],
-    ['Briefed to operatives', 'see attached briefing register']
+    ["Prepared by", ""],
+    ["Position", ""],
+    ["Signature / Date", ""],
+    ["Reviewed by (PC)", ""],
+    ["Briefed to operatives", "see attached briefing register"],
   ];
-
   children.push(new Table({
     width: { size: 9360, type: WidthType.DXA },
     columnWidths: [2800, 6560],
     rows: signRows.map(([k, v]) => new TableRow({
-      children: [
-        cell(k, 2800, { fill: 'EBE6DA', bold: true }),
-        cell(v, 6560)
-      ]
+      children: [cell(k, 2800, { fill: "EBE6DA", bold: true }), cell(v, 6560)]
     }))
   }));
 
+  // Assumptions
   if (r.assumptions && r.assumptions.length) {
-    children.push(new Paragraph({
-      heading: HeadingLevel.HEADING_1,
-      spacing: { before: 300 },
-      children: [
-        new TextRun({
-          text: 'Assumptions & Gaps Flagged for Review',
-          bold: true,
-          color: 'C8341C'
-        })
-      ]
-    }));
-
+    children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 300 }, children: [new TextRun({ text: "Assumptions & Gaps Flagged for Review", bold: true, color: "C8341C" })] }));
     r.assumptions.forEach(a => {
       children.push(new Paragraph({
-        numbering: {
-          reference: 'bullets',
-          level: 0
-        },
-        children: [
-          new TextRun({
-            text: a,
-            size: 22
-          })
-        ]
+        numbering: { reference: "bullets", level: 0 },
+        children: [new TextRun({ text: a, size: 22 })]
       }));
     });
   }
 
   const doc = new Document({
-    creator: 'Schofield Construction RAMS Generator',
+    creator: "Schofield Construction RAMS Generator",
     title: r.title,
     styles: {
-      default: {
-        document: {
-          run: {
-            font: 'Calibri',
-            size: 22
-          }
-        }
-      },
+      default: { document: { run: { font: "Calibri", size: 22 } } },
       paragraphStyles: [
         {
-          id: 'Title',
-          name: 'Title',
-          basedOn: 'Normal',
-          next: 'Normal',
-          quickFormat: true,
-          run: {
-            size: 40,
-            bold: true,
-            font: 'Calibri'
-          },
-          paragraph: {
-            spacing: {
-              before: 0,
-              after: 200
-            },
-            outlineLevel: 0
-          }
+          id: "Title", name: "Title", basedOn: "Normal", next: "Normal", quickFormat: true,
+          run: { size: 40, bold: true, font: "Calibri" },
+          paragraph: { spacing: { before: 0, after: 200 }, outlineLevel: 0 }
         },
         {
-          id: 'Heading1',
-          name: 'Heading 1',
-          basedOn: 'Normal',
-          next: 'Normal',
-          quickFormat: true,
-          run: {
-            size: 28,
-            bold: true,
-            font: 'Calibri',
-            color: '1A1F1B'
-          },
-          paragraph: {
-            spacing: {
-              before: 240,
-              after: 120
-            },
-            outlineLevel: 0
-          }
-        }
+          id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
+          run: { size: 28, bold: true, font: "Calibri", color: "1A1F1B" },
+          paragraph: { spacing: { before: 240, after: 120 }, outlineLevel: 0 }
+        },
       ]
     },
     numbering: {
       config: [
         {
-          reference: 'bullets',
-          levels: [
-            {
-              level: 0,
-              format: LevelFormat.BULLET,
-              text: '•',
-              alignment: AlignmentType.LEFT,
-              style: {
-                paragraph: {
-                  indent: {
-                    left: 540,
-                    hanging: 270
-                  }
-                }
-              }
-            }
-          ]
+          reference: "bullets",
+          levels: [{
+            level: 0, format: LevelFormat.BULLET, text: "•", alignment: AlignmentType.LEFT,
+            style: { paragraph: { indent: { left: 540, hanging: 270 } } }
+          }]
         },
         {
-          reference: 'numbers',
-          levels: [
-            {
-              level: 0,
-              format: LevelFormat.DECIMAL,
-              text: '%1.',
-              alignment: AlignmentType.LEFT,
-              style: {
-                paragraph: {
-                  indent: {
-                    left: 540,
-                    hanging: 270
-                  }
-                }
-              }
-            }
-          ]
-        }
+          reference: "numbers",
+          levels: [{
+            level: 0, format: LevelFormat.DECIMAL, text: "%1.", alignment: AlignmentType.LEFT,
+            style: { paragraph: { indent: { left: 540, hanging: 270 } } }
+          }]
+        },
       ]
     },
-    sections: [
-      {
-        properties: {
-          page: {
-            size: {
-              width: 11906,
-              height: 16838
-            },
-            margin: {
-              top: 1134,
-              right: 1134,
-              bottom: 1134,
-              left: 1134
-            }
-          }
-        },
-        headers: {
-          default: new Header({
+    sections: [{
+      properties: {
+        page: {
+          size: { width: 11906, height: 16838 },
+          margin: { top: 1134, right: 1134, bottom: 1134, left: 1134 }
+        }
+      },
+      headers: {
+        default: new Header({
+          children: [new Paragraph({
+            alignment: AlignmentType.RIGHT,
+            children: [new TextRun({
+              text: "RAMS drafted by Schofield Construction - www.schofieldconstruction.site/RAMS",
+              size: 16, color: "5A5F56"
+            })]
+          })]
+        })
+      },
+      footers: {
+        default: new Footer({
+          children: [new Paragraph({
+            alignment: AlignmentType.CENTER,
             children: [
-              new Paragraph({
-                alignment: AlignmentType.RIGHT,
-                children: [
-                  new TextRun({
-                    text: 'RAMS drafted by Schofield Construction - www.schofieldconstruction.site/RAMS',
-                    size: 16,
-                    color: '5A5F56'
-                  })
-                ]
-              })
+              new TextRun({ text: "Page ", size: 16, color: "5A5F56" }),
+              new TextRun({ children: [PageNumber.CURRENT], size: 16, color: "5A5F56" }),
+              new TextRun({ text: " of ", size: 16, color: "5A5F56" }),
+              new TextRun({ children: [PageNumber.TOTAL_PAGES], size: 16, color: "5A5F56" })
             ]
-          })
-        },
-        footers: {
-          default: new Footer({
-            children: [
-              new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [
-                  new TextRun({
-                    text: 'Page ',
-                    size: 16,
-                    color: '5A5F56'
-                  }),
-                  new TextRun({
-                    children: [PageNumber.CURRENT],
-                    size: 16,
-                    color: '5A5F56'
-                  }),
-                  new TextRun({
-                    text: ' of ',
-                    size: 16,
-                    color: '5A5F56'
-                  }),
-                  new TextRun({
-                    children: [PageNumber.TOTAL_PAGES],
-                    size: 16,
-                    color: '5A5F56'
-                  })
-                ]
-              })
-            ]
-          })
-        },
-        children
-      }
-    ]
+          })]
+        })
+      },
+      children
+    }]
   });
 
   return Packer.toBuffer(doc);
@@ -1063,10 +428,7 @@ function buildRamsDocx(r) {
 // EMAIL SENDER
 // ============================================================
 async function sendRamsEmail(contractorEmail, rams, docxBuffer) {
-  const safeName = (rams.project.name || 'RAMS')
-    .replace(/[^a-z0-9]+/gi, '_')
-    .slice(0, 40);
-
+  const safeName = (rams.project.name || "RAMS").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
   const stamp = new Date().toISOString().slice(0, 10);
   const filename = `${safeName}_RAMS_${stamp}.docx`;
 
@@ -1111,7 +473,7 @@ If you need to regenerate or amend the RAMS, return to https://schofieldconstruc
 Regards,
 Schofield Construction`;
 
-  return resend.emails.send({
+  const result = await resend.emails.send({
     from: FROM_ADDRESS,
     to: contractorEmail,
     cc: INTERNAL_CC,
@@ -1126,18 +488,17 @@ Schofield Construction`;
       }
     ]
   });
+
+  return result;
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
 
+// Simple email validation
 function isValidEmail(s) {
   if (!s || typeof s !== 'string') return false;
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
@@ -1147,142 +508,170 @@ function isValidEmail(s) {
 // MAIN ENDPOINT
 // ============================================================
 app.post('/api/generate-rams', rateLimit, async (req, res) => {
-  const startedAt = Date.now();
-  const idempotencyKey = req.headers['x-idempotency-key'] || null;
-
   try {
     const { project, docText, contractorEmail } = req.body || {};
+    const idempotencyKey = req.headers['x-idempotency-key'] || null;
 
     if (!project || !project.projectName || !project.scope) {
-      return res.status(400).json({
-        error: 'Project name and scope are required.'
-      });
+      return res.status(400).json({ error: 'Project name and scope are required.' });
     }
-
     if (!isValidEmail(contractorEmail)) {
-      return res.status(400).json({
-        error: 'A valid contractor email is required.'
-      });
+      return res.status(400).json({ error: 'A valid contractor email is required.' });
     }
 
+    // Idempotency check — has this exact request already been processed?
+    // If yes, return the cached response without re-generating or re-sending.
     if (idempotencyKey) {
       const cached = getIdempotent(idempotencyKey);
-
       if (cached) {
-        console.log('Idempotent hit:', idempotencyKey);
-        return res.json(cached);
+        console.log('Idempotent hit for key:', idempotencyKey, '— returning cached response');
+        return res.json(cached.response);
       }
-
+      // Or if a request with this key is already in flight, wait for it
       const pending = inFlight.get(idempotencyKey);
-
       if (pending) {
-        console.log('Idempotent in-flight hit:', idempotencyKey);
+        console.log('Idempotent in-flight for key:', idempotencyKey, '— awaiting');
         try {
           const result = await pending;
           return res.json(result);
         } catch (err) {
-          return res.status(500).json({
-            error: 'Request failed while already in progress. Please try again.'
-          });
+          // Fall through; the original will report the error
+          return res.status(500).json({ error: 'Request failed; please try again.' });
         }
       }
     }
 
-    const workPromise = (async () => {
-      console.log('RAMS generation started:', {
-        projectName: project.projectName,
-        hasDocText: Boolean(docText && String(docText).length > 50),
-        docTextChars: String(docText || '').length,
-        model: ANTHROPIC_MODEL
-      });
-
-      let rams;
-
-      try {
-        rams = await callClaudeForRams(project, docText);
-      } catch (err) {
-        console.error('AI generation failed:', err);
-        throw new Error(
-          'The AI service failed while generating the RAMS. This is usually a temporary Anthropic/Render connection issue or the input is too large. Try again, or shorten uploaded documents.'
-        );
-      }
-
-      let docxBuffer;
-
-      try {
-        docxBuffer = await buildRamsDocx(rams);
-      } catch (err) {
-        console.error('Failed to build Word document:', err);
-        throw new Error('Generated RAMS but failed to build the Word document.');
-      }
-
-      let emailStatus = 'sent';
-
-      try {
-        const result = await sendRamsEmail(contractorEmail, rams, docxBuffer);
-        console.log('Email sent OK:', result?.data?.id || result);
-      } catch (err) {
-        console.error('Email send failed:', err);
-        emailStatus = 'failed';
-      }
-
-      const responsePayload = {
-        rams,
-        emailStatus,
-        contractorEmail
-      };
-
-      if (idempotencyKey) {
-        saveIdempotent(idempotencyKey, responsePayload);
-      }
-
-      console.log('RAMS generation completed:', {
-        projectName: rams.project?.name,
-        emailStatus,
-        ms: Date.now() - startedAt
-      });
-
-      return responsePayload;
-    })();
-
-    if (idempotencyKey) {
-      inFlight.set(idempotencyKey, workPromise);
-    }
-
-    try {
-      const payload = await workPromise;
-      return res.json(payload);
-    } finally {
-      if (idempotencyKey) {
-        inFlight.delete(idempotencyKey);
-      }
-    }
-
-  } catch (err) {
-    console.error('RAMS endpoint error:', err);
-
-    if (idempotencyKey) {
-      inFlight.delete(idempotencyKey);
-    }
-
-    return res.status(502).json({
-      error: err.message || 'RAMS generation failed.'
+    // Create the work promise so concurrent retries can attach to it
+    let resolveWork, rejectWork;
+    const workPromise = new Promise((resolve, reject) => {
+      resolveWork = resolve;
+      rejectWork = reject;
     });
+    if (idempotencyKey) inFlight.set(idempotencyKey, workPromise);
+
+    const userMessage = `# Project information supplied by contractor
+
+Project name: ${project.projectName}
+Site address: ${project.siteAddress || '[not supplied]'}
+Contractor: ${project.contractor || '[not supplied]'}
+Principal Contractor: ${project.principalContractor || '[same as contractor]'}
+
+# Scope of works
+${project.scope}
+
+# Known hazards / constraints flagged by contractor
+${project.knownHazards || '[none flagged — you must still identify hazards from the scope]'}
+
+# Supporting site documentation (extracted text)
+${docText && docText.length > 50
+        ? docText
+        : '[No supporting documents uploaded. Generate the RAMS from the scope and call out gaps in the "assumptions" array.]'}
+
+---
+Produce the JSON RAMS now. Output JSON only.`;
+
+    // JSON extraction helper
+    const extractJson = (text) => {
+      let s = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+      const firstBrace = s.indexOf('{');
+      const lastBrace = s.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        s = s.substring(firstBrace, lastBrace + 1);
+      }
+      return s;
+    };
+
+    // One AI attempt
+    const callOnce = async (extraInstruction = '') => {
+      const message = userMessage + (extraInstruction ? '\n\n' + extraInstruction : '');
+      const response = await claude.messages.create({
+        model: 'claude-opus-4-5',
+        max_tokens: 8000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: message }]
+      });
+      const raw = response.content
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n')
+        .trim();
+      return JSON.parse(extractJson(raw));
+    };
+
+    // Call AI with retry
+    let rams;
+    try {
+      rams = await callOnce();
+    } catch (err) {
+      console.error('First AI attempt failed to parse:', err.message);
+      try {
+        rams = await callOnce(
+          'CRITICAL: Your previous response was not valid JSON. Return ONLY the JSON object — no preamble, no explanation, no markdown fences. Start with { and end with }.'
+        );
+      } catch (err2) {
+        console.error('Retry also failed:', err2.message);
+        return res.status(502).json({
+          error: 'The AI had trouble producing a structured RAMS for this input. Try with a shorter scope or fewer uploaded files.'
+        });
+      }
+    }
+
+    // Force docRef to N/A, dateIssued to today, reviewDate to blank
+    rams.project = rams.project || {};
+    rams.project.docRef = 'N/A';
+    rams.project.dateIssued = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    rams.project.reviewDate = '';
+
+    // Build the Word doc server-side
+    let docxBuffer;
+    try {
+      docxBuffer = await buildRamsDocx(rams);
+    } catch (err) {
+      console.error('Failed to build Word document:', err);
+      return res.status(500).json({ error: 'Generated RAMS but failed to build Word document.' });
+    }
+
+    // Send the email
+    let emailStatus = 'sent';
+    try {
+      const result = await sendRamsEmail(contractorEmail, rams, docxBuffer);
+      console.log('Email sent OK:', result?.data?.id || result);
+    } catch (err) {
+      console.error('Email send failed:', err);
+      emailStatus = 'failed';
+      // Don't fail the whole request — the contractor still gets the RAMS in browser
+    }
+
+    // Return RAMS JSON + email status to frontend
+    const responsePayload = {
+      rams,
+      emailStatus,
+      contractorEmail
+    };
+
+    // Save to idempotency cache so retries return the same response
+    if (idempotencyKey) {
+      saveIdempotent(idempotencyKey, responsePayload);
+      inFlight.delete(idempotencyKey);
+      if (resolveWork) resolveWork(responsePayload);
+    }
+
+    res.json(responsePayload);
+  } catch (err) {
+    console.error('RAMS generation error:', err);
+    // Clean up in-flight tracking on error so retries can attempt fresh
+    const key = req.headers['x-idempotency-key'];
+    if (key) {
+      inFlight.delete(key);
+    }
+    res.status(500).json({ error: err.message });
   }
 });
 
 // Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    version: '1.3',
-    model: ANTHROPIC_MODEL,
-    maxDocTextChars: MAX_DOC_TEXT_CHARS
-  });
-});
+app.get('/api/health', (req, res) => res.json({ ok: true, version: '1.2' }));
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log(`Schofield RAMS server v1.3 listening on :${PORT}`);
+  console.log(`Schofield RAMS server v1.1 listening on :${PORT}`);
 });
