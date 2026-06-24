@@ -642,7 +642,7 @@ Produce the JSON RAMS now. Output JSON only.`;
       const message = userMessage + (extraInstruction ? '\n\n' + extraInstruction : '');
       const response = await claude.messages.create({
         model: 'claude-opus-4-5',
-        max_tokens: 8000,
+        max_tokens: 16000,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: message }]
       });
