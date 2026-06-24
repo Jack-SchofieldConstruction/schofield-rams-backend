@@ -21,62 +21,6 @@ const {
 
 const app = express();
 app.use(cors());
-
-// ===========================================================
-// STRIPE — payment + webhook (pay-per-RAMS). Registered BEFORE
-// express.json() below because the webhook needs the raw body.
-// ===========================================================
-const Stripe = require('stripe');
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const RAMS_PRICE_PENCE = parseInt(process.env.RAMS_PRICE_PENCE || '2799', 10);
-const SITE_URL = 'https://schofieldconstruction.site/RAMS';
-
-// Generated RAMS awaiting payment, held in memory ~30 min.
-const pendingRams = new Map();
-const PENDING_TTL = 30 * 60 * 1000;
-function cleanPending() {
-  const cutoff = Date.now() - PENDING_TTL;
-  for (const [k, v] of pendingRams) if (v.createdAt < cutoff) pendingRams.delete(k);
-}
-
-// Build the Word doc and email it. Idempotent — safe to call from both the
-// webhook and the browser confirm step without double-sending.
-async function fulfillRams(ramsId) {
-  const entry = pendingRams.get(ramsId);
-  if (!entry) return { ok: false, reason: 'not_found' };
-  entry.paid = true;
-  if (entry.emailed) return { ok: true, alreadyEmailed: true };
-  entry.emailed = true;
-  try {
-    const docxBuffer = await buildRamsDocx(entry.rams);
-    await sendRamsEmail(entry.contractorEmail, entry.rams, docxBuffer);
-    console.log('Fulfilled + emailed RAMS', ramsId, 'to', entry.contractorEmail);
-  } catch (err) {
-    entry.emailed = false; // let it retry
-    console.error('Fulfilment email failed for', ramsId, err);
-  }
-  return { ok: true };
-}
-
-// Stripe webhook — MUST stay above express.json() to receive the raw body.
-app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers['stripe-signature'],
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('Webhook signature failed:', err.message);
-    return res.status(400).send('Webhook Error: ' + err.message);
-  }
-  if (event.type === 'checkout.session.completed') {
-    const ramsId = event.data.object.metadata && event.data.object.metadata.ramsId;
-    if (ramsId) await fulfillRams(ramsId);
-  }
-  res.json({ received: true });
-});
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -640,15 +584,12 @@ Produce the JSON RAMS now. Output JSON only.`;
     // One AI attempt
     const callOnce = async (extraInstruction = '') => {
       const message = userMessage + (extraInstruction ? '\n\n' + extraInstruction : '');
-      // Stream the response so the connection stays alive for long
-      // (e.g. asbestos) RAMS instead of dropping with a 'Premature close'.
-      const stream = claude.messages.stream({
+      const response = await claude.messages.create({
         model: 'claude-opus-4-5',
-        max_tokens: 16000,
+        max_tokens: 8000,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: message }]
       });
-      const response = await stream.finalMessage();
       const raw = response.content
         .filter(b => b.type === 'text')
         .map(b => b.text)
@@ -681,63 +622,40 @@ Produce the JSON RAMS now. Output JSON only.`;
     rams.project.dateIssued = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
     rams.project.reviewDate = '';
 
-    // PAYWALL TOGGLE: requests WITHOUT { paywall: true } behave exactly as
-    // before (build doc, email now, return full RAMS). Requests WITH it hold
-    // the RAMS for payment and return only a locked preview. This lets the
-    // live /RAMS page keep working unchanged while /RAMSTEST tests payments.
-    const paywall = !!(req.body && req.body.paywall);
-
-    if (!paywall) {
-      // ----- ORIGINAL FREE FLOW (unchanged) -----
-      let docxBuffer;
-      try {
-        docxBuffer = await buildRamsDocx(rams);
-      } catch (err) {
-        console.error('Failed to build Word document:', err);
-        return res.status(500).json({ error: 'Generated RAMS but failed to build Word document.' });
-      }
-
-      let emailStatus = 'sent';
-      try {
-        const result = await sendRamsEmail(contractorEmail, rams, docxBuffer);
-        console.log('Email sent OK:', result?.data?.id || result);
-      } catch (err) {
-        console.error('Email send failed:', err);
-        emailStatus = 'failed';
-      }
-
-      const responsePayload = { rams, emailStatus, contractorEmail };
-      if (idempotencyKey) {
-        saveIdempotent(idempotencyKey, responsePayload);
-        inFlight.delete(idempotencyKey);
-        if (resolveWork) resolveWork(responsePayload);
-      }
-      return res.json(responsePayload);
+    // Build the Word doc server-side
+    let docxBuffer;
+    try {
+      docxBuffer = await buildRamsDocx(rams);
+    } catch (err) {
+      console.error('Failed to build Word document:', err);
+      return res.status(500).json({ error: 'Generated RAMS but failed to build Word document.' });
     }
 
-    // ----- NEW PAYWALL FLOW: hold in memory, return locked preview only -----
-    cleanPending();
-    const ramsId = 'ram_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-    pendingRams.set(ramsId, {
-      rams, contractorEmail, paid: false, emailed: false, createdAt: Date.now()
-    });
+    // Send the email
+    let emailStatus = 'sent';
+    try {
+      const result = await sendRamsEmail(contractorEmail, rams, docxBuffer);
+      console.log('Email sent OK:', result?.data?.id || result);
+    } catch (err) {
+      console.error('Email send failed:', err);
+      emailStatus = 'failed';
+      // Don't fail the whole request — the contractor still gets the RAMS in browser
+    }
 
-    const allHazards = Array.isArray(rams.hazards) ? rams.hazards : [];
+    // Return RAMS JSON + email status to frontend
     const responsePayload = {
-      ramsId,
-      paid: false,
-      priceGBP: (RAMS_PRICE_PENCE / 100).toFixed(2),
-      preview: {
-        project: rams.project,
-        hazardsTotal: allHazards.length,
-        hazardsSample: allHazards.slice(0, 2)
-      }
+      rams,
+      emailStatus,
+      contractorEmail
     };
+
+    // Save to idempotency cache so retries return the same response
     if (idempotencyKey) {
       saveIdempotent(idempotencyKey, responsePayload);
       inFlight.delete(idempotencyKey);
       if (resolveWork) resolveWork(responsePayload);
     }
+
     res.json(responsePayload);
   } catch (err) {
     console.error('RAMS generation error:', err);
@@ -751,64 +669,6 @@ Produce the JSON RAMS now. Output JSON only.`;
 });
 
 // Health check
-// Create a Stripe Checkout session for a pending RAMS
-app.post('/api/create-checkout', async (req, res) => {
-  try {
-    const { ramsId } = req.body || {};
-    const entry = pendingRams.get(ramsId);
-    if (!entry) return res.status(404).json({ error: 'This RAMS has expired — please generate it again.' });
-    const projectName = (entry.rams.project && entry.rams.project.name) || 'RAMS document';
-    // Return to whichever page started checkout (validated to our own site).
-    let base = SITE_URL;
-    const returnUrl = req.body && req.body.returnUrl;
-    if (typeof returnUrl === 'string' && returnUrl.indexOf('https://schofieldconstruction.site') === 0) {
-      base = returnUrl.split('?')[0].replace(/\/+$/, '');
-    }
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      line_items: [{
-        quantity: 1,
-        price_data: {
-          currency: 'gbp',
-          unit_amount: RAMS_PRICE_PENCE,
-          product_data: {
-            name: 'RAMS document — ' + projectName,
-            description: 'AI-generated Risk Assessment & Method Statement (CDM 2015 / HSG150)'
-          }
-        }
-      }],
-      customer_email: entry.contractorEmail,
-      metadata: { ramsId },
-      success_url: base + '/?paid=1&ramsId=' + ramsId + '&session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: base + '/?canceled=1&ramsId=' + ramsId
-    });
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error('create-checkout error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Browser calls this on return from Stripe — verifies payment, releases the RAMS
-app.post('/api/confirm', async (req, res) => {
-  try {
-    const { ramsId, sessionId } = req.body || {};
-    const entry = pendingRams.get(ramsId);
-    if (!entry) return res.status(404).json({ error: 'This RAMS has expired — please generate it again.' });
-    if (!entry.paid) {
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
-      if (!session || session.payment_status !== 'paid' || session.metadata.ramsId !== ramsId) {
-        return res.status(402).json({ error: 'Payment not confirmed.' });
-      }
-      await fulfillRams(ramsId);
-    }
-    res.json({ paid: true, rams: entry.rams, contractorEmail: entry.contractorEmail });
-  } catch (err) {
-    console.error('confirm error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.get('/api/health', (req, res) => res.json({ ok: true, version: '1.2' }));
 
 const PORT = process.env.PORT || 3000;
