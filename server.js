@@ -640,12 +640,15 @@ Produce the JSON RAMS now. Output JSON only.`;
     // One AI attempt
     const callOnce = async (extraInstruction = '') => {
       const message = userMessage + (extraInstruction ? '\n\n' + extraInstruction : '');
-      const response = await claude.messages.create({
+      // Stream the response so the connection stays alive for long
+      // (e.g. asbestos) RAMS instead of dropping with a 'Premature close'.
+      const stream = claude.messages.stream({
         model: 'claude-opus-4-5',
         max_tokens: 16000,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: message }]
       });
+      const response = await stream.finalMessage();
       const raw = response.content
         .filter(b => b.type === 'text')
         .map(b => b.text)
