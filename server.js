@@ -643,7 +643,7 @@ Produce the JSON RAMS now. Output JSON only.`;
       // Stream the response so the connection stays alive for long
       // (e.g. asbestos) RAMS instead of dropping with a 'Premature close'.
       const stream = claude.messages.stream({
-        model: 'claude-opus-4-5',
+        model: 'claude-opus-4-8',
         max_tokens: 16000,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: message }]
